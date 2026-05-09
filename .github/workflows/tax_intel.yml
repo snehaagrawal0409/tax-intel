@@ -1,0 +1,109 @@
+name: Tax Intelligence System
+
+on:
+  schedule:
+    # Runs every 2 hours
+    - cron: "0 */2 * * *"
+  workflow_dispatch:
+    # Allow manual trigger from GitHub Actions UI
+    inputs:
+      debug_mode:
+        description: "Enable debug logging"
+        required: false
+        default: "false"
+
+jobs:
+  run-tax-intel:
+    name: Run Tax Intelligence System
+    runs-on: ubuntu-latest
+    timeout-minutes: 30   # Kill if hangs
+
+    steps:
+      # ── 1. Checkout ─────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Restore cached state (deduplication DB) ───────────────────────
+      - name: Restore deduplication state
+        uses: actions/cache@v4
+        with:
+          path: state/
+          key: tax-intel-state-${{ runner.os }}
+          restore-keys: |
+            tax-intel-state-
+
+      # ── 3. Set up Python ─────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # ── 4. Install dependencies ──────────────────────────────────────────
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # ── 5. Create required directories ───────────────────────────────────
+      - name: Prepare directories
+        run: |
+          mkdir -p state logs
+
+      # ── 6. Run the system ────────────────────────────────────────────────
+      - name: Run Tax Intelligence System
+        env:
+          TELEGRAM_BOT_TOKEN:         ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHANNEL_NOTIF:     ${{ secrets.TELEGRAM_CHANNEL_NOTIF }}
+          TELEGRAM_CHANNEL_CIRCULAR:  ${{ secrets.TELEGRAM_CHANNEL_CIRCULAR }}
+          TELEGRAM_CHANNEL_CASELAW:   ${{ secrets.TELEGRAM_CHANNEL_CASELAW }}
+          TELEGRAM_CHANNEL_IMPORTANT: ${{ secrets.TELEGRAM_CHANNEL_IMPORTANT }}
+          GOOGLE_SHEETS_CREDENTIALS:  ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
+          GOOGLE_SHEET_ID:            ${{ secrets.GOOGLE_SHEET_ID }}
+          LOG_LEVEL:                  ${{ github.event.inputs.debug_mode == 'true' && 'DEBUG' || 'INFO' }}
+        run: python main.py
+
+      # ── 7. Upload logs as artifact ───────────────────────────────────────
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tax-intel-logs-${{ github.run_number }}
+          path: logs/
+          retention-days: 7
+
+      # ── 8. Commit updated state back to repo ─────────────────────────────
+      # This persists the JSON state backup so new CI runs don't re-process old items
+      - name: Commit state backup
+        if: always()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state/seen_items.json || true
+          git diff --staged --quiet || git commit -m "chore: update dedup state [skip ci]"
+          git push || true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── 9. Notify on failure ─────────────────────────────────────────────
+      - name: Send failure notification
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN:         ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHANNEL_IMPORTANT: ${{ secrets.TELEGRAM_CHANNEL_IMPORTANT }}
+        run: |
+          python -c "
+          import os, requests
+          token = os.getenv('TELEGRAM_BOT_TOKEN', '')
+          channel = os.getenv('TELEGRAM_CHANNEL_IMPORTANT', '')
+          if token and channel:
+              requests.post(
+                  f'https://api.telegram.org/bot{token}/sendMessage',
+                  json={
+                      'chat_id': channel,
+                      'text': '⚠️ Tax Intelligence System run FAILED. Check GitHub Actions logs.',
+                      'parse_mode': 'HTML'
+                  },
+                  timeout=10
+              )
+          "
