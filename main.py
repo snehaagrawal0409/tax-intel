@@ -1,34 +1,19 @@
 """
-main.py
-Main orchestrator for the Tax Intelligence System.
-
-Pipeline per source:
-  1. Scrape listing page → list of items
-  2. Deduplicate (skip already seen)
-  3. For each new item:
-     a. Fetch full content (HTML/PDF)
-     b. Extract clean text
-     c. Summarize
-     d. Detect IT sections
-  4. Send to Telegram
-  5. Write to Google Sheets
-  6. Mark as seen
+main.py — Tax Intelligence System Orchestrator
 """
 
-import sys
 import os
+import sys
 import time
 from datetime import datetime, timezone
-from typing import Dict, List
 
-# Ensure project root is in path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config.settings import SOURCES
 from src.logger import get_logger
 from src.state_manager import is_seen, mark_seen, restore_from_json_if_empty
 from src.scrapers import scrape_notifications, scrape_circulars, scrape_caselaws
-from src.content_extractor import extract_content_from_url, simple_summarize
+from src.content_extractor import fetch_content, summarize
 from src.section_analyzer import detect_sections, sections_display
 from src.telegram_sender import send_item, send_error_alert
 from src.sheets_writer import append_item, ensure_all_tabs
@@ -36,196 +21,163 @@ from src.sheets_writer import append_item, ensure_all_tabs
 logger = get_logger("main")
 
 
-# ─── Process a single item ────────────────────────────────────────────────────
+def _log_env_check():
+    """Log which env vars are set (not values) to help debug secrets issues."""
+    vars_to_check = [
+        "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHANNEL_NOTIF",
+        "TELEGRAM_CHANNEL_CIRCULAR", "TELEGRAM_CHANNEL_CASELAW",
+        "TELEGRAM_CHANNEL_IMPORTANT", "GOOGLE_SHEET_ID",
+        "GOOGLE_SHEETS_CREDENTIALS",
+    ]
+    logger.info("=== ENV VAR CHECK ===")
+    for v in vars_to_check:
+        val = os.environ.get(v, "")
+        if val:
+            # Show first 6 chars only for security
+            preview = val[:6] + "..." if len(val) > 6 else val
+            logger.info(f"  {v}: SET ({preview})")
+        else:
+            logger.warning(f"  {v}: *** NOT SET ***")
+    logger.info("====================")
 
-def process_item(item: Dict, tab_name: str) -> bool:
-    """
-    Fully process one scraped item:
-    extract content → summarize → detect sections → send → store.
-    Returns True if successfully processed.
-    """
-    uid = item.get("unique_id", "")
-    title = item.get("title", "")
-    url = item.get("url", "")
+
+def process_item(item: dict, tab_name: str) -> bool:
+    uid        = item.get("unique_id", "")
+    title      = item.get("title", "")
+    url        = item.get("url", "")
     source_type = item.get("source_type", "")
 
-    logger.info(f"Processing [{source_type}] {title[:70]}")
+    logger.info(f"  Processing: {title[:70]}")
 
-    # ── Content extraction ─────────────────────────────────────────────────
-    content = ""
-    content_type = "unknown"
+    # Content extraction
+    content, ctype = "", "none"
     try:
-        content, content_type = extract_content_from_url(url)
-        logger.debug(f"Extracted {len(content)} chars ({content_type}) from {url}")
+        content, ctype = fetch_content(url)
+        logger.debug(f"  Content: {len(content)} chars ({ctype})")
     except Exception as e:
-        logger.warning(f"Content extraction failed for {url}: {e}")
-        content = title  # fallback: use title as content
+        logger.warning(f"  Content extraction error: {e}")
 
-    if not content or len(content.strip()) < 20:
+    if not content or len(content.strip()) < 30:
         content = title
-        logger.warning(f"Empty content, using title as fallback for {uid}")
+        logger.warning(f"  Using title as content fallback")
 
-    # ── Summarize ──────────────────────────────────────────────────────────
+    # Summarize
     try:
-        summary = simple_summarize(content)
+        summary = summarize(content)
     except Exception as e:
-        logger.warning(f"Summarization failed: {e}")
-        summary = content[:300] + "…"
+        logger.warning(f"  Summarize error: {e}")
+        summary = content[:400] + "…"
 
-    # ── Detect sections ────────────────────────────────────────────────────
-    # Detect from both title and content for better coverage
-    detection_text = f"{title}\n{content}"
+    # Detect sections — from title + content combined
     try:
-        sections = detect_sections(detection_text)
+        sections = detect_sections(f"{title}\n{content}")
     except Exception as e:
-        logger.warning(f"Section detection failed: {e}")
+        logger.warning(f"  Section detect error: {e}")
         sections = []
 
-    # ── Enrich item ────────────────────────────────────────────────────────
-    scraped_at = datetime.now(timezone.utc).isoformat()
     enriched = {
         **item,
-        "content": content,
-        "content_type": content_type,
-        "summary": summary,
-        "sections": sections,
+        "summary":      summary,
+        "sections":     sections,
         "sections_str": sections_display(sections),
-        "scraped_at": scraped_at,
+        "scraped_at":   datetime.now(timezone.utc).isoformat(),
     }
 
-    # ── Send to Telegram ───────────────────────────────────────────────────
+    # Send Telegram
     tg_ok = False
     try:
         tg_ok = send_item(enriched)
-        if tg_ok:
-            logger.info(f"✅ Telegram sent: {title[:60]}")
-        else:
-            logger.warning(f"⚠️ Telegram send failed: {title[:60]}")
+        logger.info(f"  Telegram: {'✅ sent' if tg_ok else '❌ failed'}")
     except Exception as e:
-        logger.error(f"Telegram exception for {uid}: {e}")
+        logger.error(f"  Telegram exception: {e}")
 
-    # ── Write to Google Sheets ─────────────────────────────────────────────
+    # Write Sheet
     sheet_ok = False
     try:
         sheet_ok = append_item(enriched, tab_name)
-        if sheet_ok:
-            logger.info(f"✅ Sheet written: {title[:60]}")
-        else:
-            logger.warning(f"⚠️ Sheet write failed: {title[:60]}")
+        logger.info(f"  Sheet: {'✅ written' if sheet_ok else '❌ failed'}")
     except Exception as e:
-        logger.error(f"Sheet exception for {uid}: {e}")
+        logger.error(f"  Sheet exception: {e}")
 
-    # ── Mark as seen (even if downstream failed, to avoid re-scraping) ─────
+    # Always mark seen to avoid infinite retries on broken items
     mark_seen(uid, source_type, title)
 
-    return tg_ok or sheet_ok  # success if at least one output worked
+    return tg_ok or sheet_ok
 
 
-# ─── Process a source ─────────────────────────────────────────────────────────
+def process_source(key: str, scraper_fn) -> dict:
+    cfg = SOURCES[key]
+    tab = cfg["sheet_tab"]
 
-def process_source(source_key: str, scraper_fn) -> Dict:
-    """
-    Run scraper, filter new items, process each one.
-    Returns stats dict.
-    """
-    cfg = SOURCES[source_key]
-    tab_name = cfg["sheet_tab"]
-    source_type = cfg["type"]
+    logger.info(f"\n{'─'*50}")
+    logger.info(f"SOURCE: {key.upper()}")
+    logger.info(f"{'─'*50}")
 
-    logger.info(f"\n{'═'*50}")
-    logger.info(f"🔍 Processing source: {source_key.upper()}")
-    logger.info(f"{'═'*50}")
+    stats = {"source": key, "scraped": 0, "new": 0, "processed": 0, "errors": 0}
 
-    stats = {
-        "source": source_key,
-        "scraped": 0,
-        "new": 0,
-        "processed": 0,
-        "errors": 0,
-    }
-
-    # Scrape
     try:
         items = scraper_fn()
         stats["scraped"] = len(items)
-        logger.info(f"Scraped {len(items)} items from {source_key}")
     except Exception as e:
-        logger.error(f"Scraper crashed for {source_key}: {e}", exc_info=True)
-        send_error_alert(f"Scraper crashed for {source_key}: {e}")
+        logger.error(f"Scraper crashed for {key}: {e}", exc_info=True)
+        send_error_alert(f"Scraper crashed for {key}: {e}")
         return stats
 
     if not items:
-        logger.warning(f"Zero items scraped from {source_key} — check source or scraping logic")
-
-    # Filter new items
-    new_items = [item for item in items if not is_seen(item.get("unique_id", ""))]
-    stats["new"] = len(new_items)
-    logger.info(f"New items (not yet processed): {len(new_items)}/{len(items)}")
-
-    if not new_items:
-        logger.info(f"No new items for {source_key}")
+        logger.warning(f"Zero items scraped from {key}")
         return stats
 
-    # Process each new item
+    new_items = [i for i in items if not is_seen(i.get("unique_id", ""))]
+    stats["new"] = len(new_items)
+    logger.info(f"New items: {len(new_items)} / {len(items)} total")
+
     for item in new_items:
         try:
-            ok = process_item(item, tab_name)
+            ok = process_item(item, tab)
             if ok:
                 stats["processed"] += 1
             else:
                 stats["errors"] += 1
         except Exception as e:
-            logger.error(f"process_item crashed for {item.get('unique_id')}: {e}", exc_info=True)
+            logger.error(f"process_item crashed: {e}", exc_info=True)
             stats["errors"] += 1
-            # Still mark as seen to avoid infinite retry loops on broken items
-            mark_seen(item.get("unique_id", ""), source_type, item.get("title", ""))
-
-        # Small delay between items to be polite to servers
+            mark_seen(item.get("unique_id", ""), cfg["type"], item.get("title", ""))
         time.sleep(1)
 
     return stats
 
 
-# ─── Main entry point ─────────────────────────────────────────────────────────
-
 def main():
     logger.info("=" * 60)
-    logger.info("🚀 Tax Intelligence System — Starting Run")
-    logger.info(f"Timestamp: {datetime.now(timezone.utc).isoformat()}")
+    logger.info("TAX INTELLIGENCE SYSTEM — START")
+    logger.info(f"Time: {datetime.now(timezone.utc).isoformat()}")
     logger.info("=" * 60)
 
-    # Restore dedup state from JSON backup on fresh CI environments
+    _log_env_check()
     restore_from_json_if_empty()
 
-    # Ensure Google Sheets tabs exist
     try:
         ensure_all_tabs()
     except Exception as e:
-        logger.warning(f"Could not ensure sheet tabs: {e}")
+        logger.warning(f"Sheet tab setup warning: {e}")
 
-    all_stats = []
-
-    # Source → scraper function mapping
     sources = [
         ("notifications", scrape_notifications),
         ("circulars",     scrape_circulars),
         ("caselaws",      scrape_caselaws),
     ]
 
-    for source_key, scraper_fn in sources:
+    all_stats = []
+    for key, fn in sources:
         try:
-            stats = process_source(source_key, scraper_fn)
+            stats = process_source(key, fn)
             all_stats.append(stats)
         except Exception as e:
-            logger.error(f"Fatal error processing {source_key}: {e}", exc_info=True)
-            all_stats.append({"source": source_key, "error": str(e)})
+            logger.error(f"Fatal error for {key}: {e}", exc_info=True)
 
-    # ── Summary ────────────────────────────────────────────────────────────
     logger.info("\n" + "=" * 60)
-    logger.info("📊 RUN SUMMARY")
+    logger.info("SUMMARY")
     logger.info("=" * 60)
-    total_new = 0
-    total_processed = 0
     for s in all_stats:
         logger.info(
             f"  {s.get('source','?').upper():15s} | "
@@ -234,12 +186,8 @@ def main():
             f"processed={s.get('processed',0):3d} | "
             f"errors={s.get('errors',0):3d}"
         )
-        total_new += s.get("new", 0)
-        total_processed += s.get("processed", 0)
-
-    logger.info(f"\n  TOTAL: {total_new} new items found, {total_processed} successfully processed")
     logger.info("=" * 60)
-    logger.info("✅ Run complete\n")
+    logger.info("DONE\n")
 
 
 if __name__ == "__main__":

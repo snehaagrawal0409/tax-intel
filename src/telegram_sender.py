@@ -1,12 +1,11 @@
 """
 src/telegram_sender.py
-Fixed: reads ALL env vars at call-time (not import-time).
-This is critical for GitHub Actions where secrets are injected at runtime.
+Reads ALL credentials from environment at call-time.
 """
 
 import os
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import requests
 
@@ -15,139 +14,131 @@ from src.logger import get_logger
 
 logger = get_logger("telegram_sender")
 
-_TYPE_EMOJI = {
-    "Notification": "📋",
-    "Circular":     "🔵",
-    "Case Law":     "⚖️",
-}
-
-TELEGRAM_MAX_LEN    = 4096
-TELEGRAM_RETRY      = 3
-TELEGRAM_RETRY_DELAY = 4
+_TYPE_EMOJI = {"Notification": "📋", "Circular": "🔵", "Case Law": "⚖️"}
+MAX_LEN     = 4096
+RETRIES     = 3
+RETRY_DELAY = 4
 
 
-def _token():
+def _token() -> str:
     return os.environ.get("TELEGRAM_BOT_TOKEN", "")
 
 def _channel(source_type: str) -> str:
-    mapping = {
+    return {
         "Notification": os.environ.get("TELEGRAM_CHANNEL_NOTIF", ""),
         "Circular":     os.environ.get("TELEGRAM_CHANNEL_CIRCULAR", ""),
         "Case Law":     os.environ.get("TELEGRAM_CHANNEL_CASELAW", ""),
-    }
-    return mapping.get(source_type, "")
+    }.get(source_type, "")
 
-def _important_channel():
+def _important_ch() -> str:
     return os.environ.get("TELEGRAM_CHANNEL_IMPORTANT", "")
 
 
-def _build_message(item: Dict) -> str:
-    emoji = _TYPE_EMOJI.get(item.get("source_type", ""), "📄")
+def _build_msg(item: Dict) -> str:
+    emoji    = _TYPE_EMOJI.get(item.get("source_type", ""), "📄")
     sections = item.get("sections", [])
-    imp_flag = " 🔥 <b>IMPORTANT SECTIONS</b>" if is_important(sections) else ""
-    sections_str = sections_display(sections)
-    summary = (item.get("summary") or "No summary available.")[:800]
+    imp_flag = " 🔥 <b>IMPORTANT</b>" if is_important(sections) else ""
+    summary  = (item.get("summary") or "No summary available.")[:600]
+    title    = (item.get("title") or "N/A")[:300]
+    date     = item.get("date") or "N/A"
+    url      = item.get("url", "")
+    stype    = item.get("source_type", "Update")
+    secs     = sections_display(sections)
 
     return (
-        f"{emoji} <b>{item.get('source_type', 'Update')}</b>{imp_flag}\n"
+        f"{emoji} <b>{stype}</b>{imp_flag}\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"📅 <b>Date:</b> {item.get('date') or 'N/A'}\n"
-        f"📌 <b>Title:</b> {(item.get('title') or 'N/A')[:300]}\n"
-        f"🏷️ <b>Sections:</b> {sections_str}\n"
+        f"📅 <b>Date:</b> {date}\n"
+        f"📌 <b>Title:</b> {title}\n"
+        f"🏷 <b>Sections:</b> {secs}\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📝 <b>Summary:</b>\n{summary}\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"🔗 <a href=\"{item.get('url', '')}\">View Source</a>"
+        f"🔗 <a href=\"{url}\">View Source</a>"
     )
 
 
-def _split_message(text: str) -> List[str]:
-    if len(text) <= TELEGRAM_MAX_LEN:
+def _split(text: str) -> List[str]:
+    if len(text) <= MAX_LEN:
         return [text]
     chunks = []
     while text:
-        if len(text) <= TELEGRAM_MAX_LEN:
+        if len(text) <= MAX_LEN:
             chunks.append(text)
             break
-        split_at = text.rfind("\n", 0, TELEGRAM_MAX_LEN)
-        if split_at == -1:
-            split_at = TELEGRAM_MAX_LEN
-        chunks.append(text[:split_at])
-        text = text[split_at:].lstrip()
+        cut = text.rfind("\n", 0, MAX_LEN)
+        if cut == -1:
+            cut = MAX_LEN
+        chunks.append(text[:cut])
+        text = text[cut:].lstrip()
     return chunks
 
 
-def _send_to_channel(channel: str, text: str) -> bool:
+def _send(channel: str, text: str) -> bool:
     token = _token()
     if not token:
-        logger.error("TELEGRAM_BOT_TOKEN is not set")
+        logger.error("TELEGRAM_BOT_TOKEN not set")
         return False
     if not channel:
-        logger.warning("No Telegram channel configured — skipping")
+        logger.warning("No Telegram channel set — skipping")
         return False
 
-    api_url = f"https://api.telegram.org/bot{token}/sendMessage"
-    chunks = _split_message(text)
-
-    for i, chunk in enumerate(chunks):
+    api = f"https://api.telegram.org/bot{token}/sendMessage"
+    for i, chunk in enumerate(_split(text)):
         sent = False
-        for attempt in range(1, TELEGRAM_RETRY + 1):
+        for attempt in range(1, RETRIES + 1):
             try:
-                resp = requests.post(
-                    api_url,
-                    json={
-                        "chat_id": channel,
-                        "text": chunk,
-                        "parse_mode": "HTML",
-                        "disable_web_page_preview": True,
-                    },
+                r = requests.post(
+                    api,
+                    json={"chat_id": channel, "text": chunk,
+                          "parse_mode": "HTML", "disable_web_page_preview": True},
                     timeout=15,
                 )
-                if resp.ok:
-                    logger.debug(f"Sent chunk {i+1}/{len(chunks)} to {channel}")
+                if r.ok:
                     sent = True
                     break
-                else:
-                    err = resp.json().get("description", resp.text[:200])
-                    logger.warning(f"Telegram API error attempt {attempt}: {resp.status_code} — {err}")
+                # Log exact Telegram error
+                err = r.json().get("description", r.text[:300])
+                logger.warning(f"Telegram error (attempt {attempt}): {r.status_code} — {err}")
+                # If bad channel ID, no point retrying
+                if r.status_code == 400 and "chat not found" in err.lower():
+                    logger.error(f"CHANNEL NOT FOUND: '{channel}' — check TELEGRAM_CHANNEL_* secret")
+                    return False
             except Exception as e:
-                logger.warning(f"Telegram send attempt {attempt} exception: {e}")
-
-            if attempt < TELEGRAM_RETRY:
-                time.sleep(TELEGRAM_RETRY_DELAY)
+                logger.warning(f"Telegram send exception attempt {attempt}: {e}")
+            if attempt < RETRIES:
+                time.sleep(RETRY_DELAY)
 
         if not sent:
-            logger.error(f"Failed to send to {channel} after {TELEGRAM_RETRY} attempts")
+            logger.error(f"Failed sending chunk {i+1} to {channel}")
             return False
-
-        if len(chunks) > 1:
+        if i > 0:
             time.sleep(0.5)
 
     return True
 
 
 def send_item(item: Dict) -> bool:
-    source_type = item.get("source_type", "")
-    channel = _channel(source_type)
-
-    if not channel:
-        logger.warning(f"No channel configured for source_type='{source_type}' — check secrets")
+    ch = _channel(item.get("source_type", ""))
+    if not ch:
+        logger.error(
+            f"No channel env var set for source_type='{item.get('source_type')}'. "
+            f"Check TELEGRAM_CHANNEL_NOTIF / TELEGRAM_CHANNEL_CIRCULAR / TELEGRAM_CHANNEL_CASELAW secrets."
+        )
         return False
 
-    msg = _build_message(item)
-    primary_ok = _send_to_channel(channel, msg)
+    msg = _build_msg(item)
+    ok  = _send(ch, msg)
 
-    # Also route to IMPORTANT channel if relevant sections found
-    sections = item.get("sections", [])
-    imp_ch = _important_channel()
-    if is_important(sections) and imp_ch and imp_ch != channel:
-        logger.info(f"Routing to IMPORTANT channel: {item.get('title', '')[:60]}")
-        _send_to_channel(imp_ch, msg)
+    # Also send to important channel if relevant sections
+    imp = _important_ch()
+    if is_important(item.get("sections", [])) and imp and imp != ch:
+        _send(imp, msg)
 
-    return primary_ok
+    return ok
 
 
 def send_error_alert(message: str):
-    target = _important_channel() or os.environ.get("TELEGRAM_CHANNEL_NOTIF", "")
-    if target:
-        _send_to_channel(target, f"⚠️ <b>Tax Intel Error</b>\n\n{message[:500]}")
+    ch = _important_ch() or os.environ.get("TELEGRAM_CHANNEL_NOTIF", "")
+    if ch:
+        _send(ch, f"⚠️ <b>Tax Intel Error</b>\n\n{message[:400]}")
