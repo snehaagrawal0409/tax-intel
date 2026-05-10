@@ -1,14 +1,10 @@
 """
 src/scrapers.py
-Source-specific scrapers for:
-  1. Income Tax Notifications (incometaxindia.gov.in)
-  2. Income Tax Circulars (incometaxindia.gov.in)
-  3. ITAT Case Laws (itatonline.org)
-
-Each scraper returns a list of dicts with fields:
-  title, url, date, source_type
-
-Full content extraction is done separately by the orchestrator.
+Fixed scrapers for all 3 sources.
+- Notifications: correct URL + PDF link extraction
+- Circulars: correct URL + PDF link extraction
+- Case Laws: itatonline.org with fallback
+- No cross-contamination between sources
 """
 
 import hashlib
@@ -16,7 +12,7 @@ import re
 import time
 from datetime import datetime
 from typing import List, Dict, Optional
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
@@ -33,13 +29,15 @@ _SESSION = requests.Session()
 _SESSION.headers.update({
     "User-Agent": USER_AGENT,
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
+    "Accept-Language": "en-IN,en-US;q=0.9,en;q=0.8",
 })
 
+_ITI_BASE = "https://www.incometaxindia.gov.in"
 
-# ─── HTTP helper ──────────────────────────────────────────────────────────────
 
-def _fetch(url: str, retries: int = MAX_RETRIES) -> Optional[BeautifulSoup]:
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def _fetch(url, retries=MAX_RETRIES):
     for attempt in range(1, retries + 1):
         try:
             resp = _SESSION.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
@@ -53,265 +51,339 @@ def _fetch(url: str, retries: int = MAX_RETRIES) -> Optional[BeautifulSoup]:
     return None
 
 
-def _fetch_fallback(urls: List[str]) -> Optional[BeautifulSoup]:
-    for url in urls:
-        soup = _fetch(url)
-        if soup:
-            return soup
-    return None
-
-
-# ─── Unique ID generation ─────────────────────────────────────────────────────
-
-def make_unique_id(source_type: str, url: str, title: str) -> str:
-    """Stable hash-based ID for deduplication."""
+def _make_uid(source_type, url, title):
     raw = f"{source_type}|{url}|{title}".lower().strip()
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
-# ─── Date parsing ─────────────────────────────────────────────────────────────
-
-_DATE_FORMATS = [
+_DATE_FMTS = [
     "%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d",
-    "%B %d, %Y", "%d %B %Y", "%b %d, %Y", "%d %b %Y",
-    "%d.%m.%Y",
+    "%B %d, %Y", "%d %B %Y", "%b %d, %Y", "%d %b %Y", "%d.%m.%Y",
 ]
 
-def parse_date(raw: str) -> str:
-    """Try to parse a date string. Returns ISO format or original."""
+def _parse_date(raw):
     if not raw:
         return ""
     raw = raw.strip()
-    for fmt in _DATE_FORMATS:
+    for fmt in _DATE_FMTS:
         try:
             return datetime.strptime(raw, fmt).strftime("%Y-%m-%d")
         except ValueError:
             pass
-    # Try extracting date-like substring
-    m = re.search(r"\d{2}[/-]\d{2}[/-]\d{4}", raw)
+    m = re.search(r"\d{2}[./-]\d{2}[./-]\d{4}", raw)
     if m:
-        return parse_date(m.group())
-    m = re.search(r"\d{4}-\d{2}-\d{2}", raw)
-    if m:
-        return m.group()
-    return raw  # return as-is if we can't parse
+        return _parse_date(m.group())
+    return raw
 
 
-# ─── SCRAPER 1: Income Tax India Notifications ────────────────────────────────
+def _dedup(items):
+    seen, result = set(), []
+    for item in items:
+        uid = item.get("unique_id", "")
+        if uid and uid not in seen:
+            seen.add(uid)
+            result.append(item)
+    return result
 
-def scrape_notifications() -> List[Dict]:
-    """
-    Scrape income tax notifications from incometaxindia.gov.in.
-    Returns list of {title, url, date, source_type, unique_id}.
-    """
-    cfg = SOURCES["notifications"]
-    logger.info(f"Scraping notifications from {cfg['url']}")
 
-    urls_to_try = [cfg["url"]] + cfg.get("fallback_urls", [])
-    soup = _fetch_fallback(urls_to_try)
-    if not soup:
-        logger.error("Could not fetch notifications page")
-        return []
+def _abs_url(href):
+    href = href.strip()
+    if href.startswith("http"):
+        return href
+    if href.startswith("/"):
+        return _ITI_BASE + href
+    return _ITI_BASE + "/" + href
 
-    items = _parse_incometaxindia_listing(soup, cfg["url"], cfg["type"])
-    logger.info(f"Found {len(items)} notifications")
+
+# ─── SCRAPER 1: Notifications ─────────────────────────────────────────────────
+
+def scrape_notifications():
+    source_type = "Notification"
+    logger.info("Scraping notifications...")
+
+    listing_urls = [
+        "https://www.incometaxindia.gov.in/communications/notification/",
+        "https://www.incometaxindia.gov.in/Pages/communications/notification.aspx",
+    ]
+
+    items = []
+    for url in listing_urls:
+        soup = _fetch(url)
+        if not soup:
+            continue
+        found = _parse_iti_listing(soup, url, source_type)
+        if found:
+            logger.info(f"Found {len(found)} notifications from {url}")
+            items = found
+            break
+
+    if not items:
+        logger.warning("Trying taxguru fallback for notifications")
+        items = _scrape_taxguru_mirror(
+            "https://taxguru.in/income-tax/notifications/", source_type
+        )
+
+    items = _dedup(items)
+    logger.info(f"Total notifications scraped: {len(items)}")
     return items[:MAX_ITEMS_PER_RUN]
 
 
-# ─── SCRAPER 2: Income Tax India Circulars ────────────────────────────────────
+# ─── SCRAPER 2: Circulars ─────────────────────────────────────────────────────
 
-def scrape_circulars() -> List[Dict]:
-    """
-    Scrape income tax circulars from incometaxindia.gov.in.
-    """
-    cfg = SOURCES["circulars"]
-    logger.info(f"Scraping circulars from {cfg['url']}")
+def scrape_circulars():
+    source_type = "Circular"
+    logger.info("Scraping circulars...")
 
-    urls_to_try = [cfg["url"]] + cfg.get("fallback_urls", [])
-    soup = _fetch_fallback(urls_to_try)
-    if not soup:
-        logger.error("Could not fetch circulars page")
-        return []
+    listing_urls = [
+        "https://www.incometaxindia.gov.in/communications/circular/",
+        "https://www.incometaxindia.gov.in/Pages/communications/circular.aspx",
+    ]
 
-    items = _parse_incometaxindia_listing(soup, cfg["url"], cfg["type"])
-    logger.info(f"Found {len(items)} circulars")
+    items = []
+    for url in listing_urls:
+        soup = _fetch(url)
+        if not soup:
+            continue
+        found = _parse_iti_listing(soup, url, source_type)
+        if found:
+            logger.info(f"Found {len(found)} circulars from {url}")
+            items = found
+            break
+
+    if not items:
+        logger.warning("Trying taxguru fallback for circulars")
+        items = _scrape_taxguru_mirror(
+            "https://taxguru.in/income-tax/circulars/", source_type
+        )
+
+    items = _dedup(items)
+    logger.info(f"Total circulars scraped: {len(items)}")
     return items[:MAX_ITEMS_PER_RUN]
 
 
-def _parse_incometaxindia_listing(soup: BeautifulSoup, base_url: str, source_type: str) -> List[Dict]:
+def _parse_iti_listing(soup, page_url, source_type):
     """
-    Parse listing pages from incometaxindia.gov.in.
-    Handles both table-based and list-based layouts robustly.
+    Parse incometaxindia.gov.in listing pages.
+    Extracts real document links (PDFs or detail pages), not nav/homepage links.
     """
     items = []
-    base = "https://www.incometaxindia.gov.in"
 
-    # Strategy 1: Table rows with links
-    rows = soup.find_all("tr")
-    for row in rows:
-        cells = row.find_all(["td", "th"])
-        link_tag = row.find("a", href=True)
-        if not link_tag:
-            continue
+    skip_hrefs = {"/", "#", "", "javascript:void(0)"}
+    skip_titles = {
+        "home", "sitemap", "contact", "feedback", "login", "logout",
+        "back", "next", "previous", "print", "share", "search",
+        "screen reader", "skip to", "english", "hindi", "accessibility",
+        "about us", "disclaimer", "privacy", "help", "faq", "subscribe",
+        "notifications", "circulars", "press releases",
+    }
 
-        href = link_tag.get("href", "").strip()
-        title = link_tag.get_text(strip=True)
+    def is_real_doc(href, title):
+        if not href or not title:
+            return False
+        href_l = href.lower()
+        title_l = title.lower().strip()
+        if href.strip() in skip_hrefs:
+            return False
+        if any(bad in href_l for bad in ["javascript:", "mailto:", "facebook", "twitter", "youtube", "instagram"]):
+            return False
+        if len(title.strip()) < 8:
+            return False
+        if title_l in skip_titles:
+            return False
+        if any(title_l.startswith(w) for w in ["home", "contact", "about", "login", "skip"]):
+            return False
+        # Positive signals
+        is_pdf = ".pdf" in href_l
+        has_number = bool(re.search(r'\d{1,4}[/\-_]\d{2,4}', title))
+        has_keyword = bool(re.search(
+            r'(notification|circular|order|instruction|press|guideline|'
+            r'amendment|clarif|cbdt|income.?tax|rule\s+\d|section\s*\d)',
+            title, re.IGNORECASE
+        ))
+        in_comms_path = any(x in href_l for x in [
+            "/communications/", "notification_", "circular_",
+            "/notification/", "/circular/",
+        ])
+        return is_pdf or has_number or has_keyword or in_comms_path
 
-        if not title or len(title) < 5:
-            continue
-
-        # Filter navigation links
-        if any(kw in href.lower() for kw in ["javascript:", "mailto:", "#"]):
-            continue
-        if any(kw in title.lower() for kw in ["home", "sitemap", "contact", "feedback", "login"]):
-            continue
-
-        url = urljoin(base, href)
-
-        # Try to find date in cells
-        date_str = ""
-        for cell in cells:
-            text = cell.get_text(strip=True)
-            if re.search(r"\d{2}[/-]\d{2}[/-]\d{4}", text) or re.search(r"\d{4}-\d{2}-\d{2}", text):
-                date_str = parse_date(text)
-                break
-
-        uid = make_unique_id(source_type, url, title)
-        items.append({
-            "title": title,
-            "url": url,
-            "date": date_str,
-            "source_type": source_type,
-            "unique_id": uid,
-        })
+    # Strategy 1: Table rows
+    for table in soup.find_all("table"):
+        for row in table.find_all("tr"):
+            link_tag = row.find("a", href=True)
+            if not link_tag:
+                continue
+            href = link_tag.get("href", "").strip()
+            title = link_tag.get_text(separator=" ", strip=True)
+            if not is_real_doc(href, title):
+                continue
+            url = _abs_url(href)
+            date_str = ""
+            for cell in row.find_all(["td", "th"]):
+                text = cell.get_text(strip=True)
+                m = re.search(r"\d{2}[./-]\d{2}[./-]\d{4}", text)
+                if m:
+                    date_str = _parse_date(m.group())
+                    break
+            uid = _make_uid(source_type, url, title)
+            items.append({"title": title, "url": url, "date": date_str,
+                          "source_type": source_type, "unique_id": uid})
 
     if items:
         return items
 
-    # Strategy 2: Direct <a> tags with PDF or doc-like hrefs
-    for a in soup.find_all("a", href=True):
+    # Strategy 2: Content area links
+    content_area = (
+        soup.find("div", id=re.compile(r"content|main|body", re.I)) or
+        soup.find("div", class_=re.compile(r"content|main|listing|table", re.I)) or
+        soup.find("main") or soup
+    )
+    for a in content_area.find_all("a", href=True):
         href = a.get("href", "").strip()
-        title = a.get_text(strip=True)
-
-        if not title or len(title) < 5:
+        title = a.get_text(separator=" ", strip=True)
+        if not is_real_doc(href, title):
             continue
-        if any(kw in href.lower() for kw in ["javascript:", "mailto:", "#", "facebook", "twitter"]):
-            continue
-        if not any(ext in href.lower() for ext in [".pdf", ".htm", ".html", ".asp", "/notifications", "/circulars"]):
-            continue
-        if any(kw in title.lower() for kw in ["home", "sitemap", "contact", "next", "previous", "back"]):
-            continue
-
-        url = urljoin(base, href)
-        uid = make_unique_id(source_type, url, title)
-        items.append({
-            "title": title,
-            "url": url,
-            "date": "",
-            "source_type": source_type,
-            "unique_id": uid,
-        })
+        url = _abs_url(href)
+        uid = _make_uid(source_type, url, title)
+        items.append({"title": title, "url": url, "date": "",
+                      "source_type": source_type, "unique_id": uid})
 
     return items
 
 
 # ─── SCRAPER 3: ITAT Case Laws ────────────────────────────────────────────────
 
-def scrape_caselaws() -> List[Dict]:
-    """
-    Scrape ITAT case law digests from itatonline.org.
-    """
-    cfg = SOURCES["caselaws"]
-    logger.info(f"Scraping case laws from {cfg['url']}")
+def scrape_caselaws():
+    source_type = "Case Law"
+    logger.info("Scraping ITAT case laws...")
 
-    urls_to_try = [cfg["url"]] + cfg.get("fallback_urls", [])
-    soup = _fetch_fallback(urls_to_try)
-    if not soup:
-        logger.error("Could not fetch case laws page")
-        return []
-
-    items = _parse_itatonline(soup, cfg["url"], cfg["type"])
-
-    # Also try paginated pages (page 2 & 3) for better coverage
-    for page_num in [2, 3]:
-        page_url = f"{cfg['url']}page/{page_num}/"
-        page_soup = _fetch(page_url)
-        if page_soup:
-            page_items = _parse_itatonline(page_soup, page_url, cfg["type"])
-            items.extend(page_items)
-            logger.debug(f"Page {page_num}: {len(page_items)} additional items")
-
-    # Deduplicate by unique_id within this batch
-    seen_ids = set()
-    deduped = []
-    for item in items:
-        if item["unique_id"] not in seen_ids:
-            seen_ids.add(item["unique_id"])
-            deduped.append(item)
-
-    logger.info(f"Found {len(deduped)} case laws")
-    return deduped[:MAX_ITEMS_PER_RUN]
-
-
-def _parse_itatonline(soup: BeautifulSoup, base_url: str, source_type: str) -> List[Dict]:
-    """Parse itatonline.org/digest listing page."""
     items = []
-    base = "https://itatonline.org"
 
-    # itatonline uses WordPress-style article listings
-    # Strategy 1: article tags
-    articles = soup.find_all("article")
-    for art in articles:
-        link_tag = art.find("a", href=True)
+    for url in [
+        "https://itatonline.org/digest/all-judgements/",
+        "https://itatonline.org/digest/",
+    ]:
+        soup = _fetch(url)
+        if not soup:
+            continue
+        found = _parse_itatonline(soup, source_type)
+        if found:
+            logger.info(f"Found {len(found)} case laws from {url}")
+            items.extend(found)
+            break
+
+    if items:
+        for pg in [2, 3]:
+            ps = _fetch(f"https://itatonline.org/digest/all-judgements/page/{pg}/")
+            if ps:
+                items.extend(_parse_itatonline(ps, source_type))
+
+    if not items:
+        logger.warning("itatonline failed, trying taxguru ITAT fallback")
+        items = _scrape_taxguru_mirror("https://taxguru.in/income-tax/itat/", source_type)
+
+    if not items:
+        logger.warning("taxguru failed, trying indiankanoon fallback")
+        items = _scrape_indiankanoon()
+
+    items = _dedup(items)
+    logger.info(f"Total case laws scraped: {len(items)}")
+    return items[:MAX_ITEMS_PER_RUN]
+
+
+def _parse_itatonline(soup, source_type):
+    items = []
+    skip = {"home", "about", "contact", "login", "register",
+            "all judgements", "digest", "category", "tag", "more"}
+
+    for article in soup.find_all("article"):
+        title_tag = article.find(["h1", "h2", "h3"])
+        if not title_tag:
+            continue
+        link_tag = title_tag.find("a", href=True) or article.find("a", href=True)
         if not link_tag:
             continue
         href = link_tag.get("href", "").strip()
-        title_tag = art.find(["h1", "h2", "h3", "h4"])
-        title = title_tag.get_text(strip=True) if title_tag else link_tag.get_text(strip=True)
-
-        if not title or len(title) < 5:
+        title = title_tag.get_text(separator=" ", strip=True)
+        if not title or len(title) < 10 or title.lower().strip() in skip:
             continue
-
-        # Date
         date_str = ""
-        date_tag = art.find("time") or art.find(attrs={"class": re.compile(r"date|time|posted", re.I)})
-        if date_tag:
-            date_str = parse_date(date_tag.get("datetime", "") or date_tag.get_text(strip=True))
-
-        url = urljoin(base, href)
-        uid = make_unique_id(source_type, url, title)
-        items.append({
-            "title": title,
-            "url": url,
-            "date": date_str,
-            "source_type": source_type,
-            "unique_id": uid,
-        })
+        dt = article.find("time") or article.find(class_=re.compile(r"date|posted|published", re.I))
+        if dt:
+            date_str = _parse_date(dt.get("datetime", "") or dt.get_text(strip=True))
+        if not href.startswith("http"):
+            href = urljoin("https://itatonline.org", href)
+        uid = _make_uid(source_type, href, title)
+        items.append({"title": title, "url": href, "date": date_str,
+                      "source_type": source_type, "unique_id": uid})
 
     if items:
         return items
 
-    # Strategy 2: h2/h3 with links (common WordPress theme pattern)
     for heading in soup.find_all(["h2", "h3"]):
         link_tag = heading.find("a", href=True)
         if not link_tag:
             continue
         href = link_tag.get("href", "").strip()
+        title = link_tag.get_text(separator=" ", strip=True)
+        if not title or len(title) < 10 or title.lower().strip() in skip:
+            continue
+        if not href.startswith("http"):
+            href = urljoin("https://itatonline.org", href)
+        uid = _make_uid(source_type, href, title)
+        items.append({"title": title, "url": href, "date": "",
+                      "source_type": source_type, "unique_id": uid})
+
+    return items
+
+
+# ─── Mirror/Fallback Scrapers ─────────────────────────────────────────────────
+
+def _scrape_taxguru_mirror(url, source_type):
+    soup = _fetch(url)
+    if not soup:
+        return []
+    items = []
+    for article in soup.find_all("article"):
+        title_tag = article.find(["h2", "h3"])
+        if not title_tag:
+            continue
+        link_tag = title_tag.find("a", href=True)
+        if not link_tag:
+            continue
+        href = link_tag.get("href", "").strip()
         title = link_tag.get_text(strip=True)
-
-        if not title or len(title) < 5:
+        if not title or len(title) < 10:
             continue
-        if any(kw in title.lower() for kw in ["home", "category", "tag", "login", "register"]):
+        date_str = ""
+        dt = article.find("time")
+        if dt:
+            date_str = _parse_date(dt.get("datetime", "") or dt.get_text())
+        uid = _make_uid(source_type, href, title)
+        items.append({"title": title, "url": href, "date": date_str,
+                      "source_type": source_type, "unique_id": uid})
+    logger.info(f"taxguru mirror ({url}): {len(items)} items")
+    return items
+
+
+def _scrape_indiankanoon():
+    source_type = "Case Law"
+    url = "https://indiankanoon.org/search/?formInput=Income+Tax+Appellate+Tribunal&pagenum=0"
+    soup = _fetch(url)
+    if not soup:
+        return []
+    items = []
+    for result in soup.find_all("div", class_=re.compile(r"result", re.I)):
+        link_tag = result.find("a", href=True)
+        if not link_tag:
             continue
-
-        url = urljoin(base, href)
-        uid = make_unique_id(source_type, url, title)
-        items.append({
-            "title": title,
-            "url": url,
-            "date": "",
-            "source_type": source_type,
-            "unique_id": uid,
-        })
-
+        href = link_tag.get("href", "").strip()
+        title = link_tag.get_text(strip=True)
+        if not title or len(title) < 10:
+            continue
+        if not href.startswith("http"):
+            href = "https://indiankanoon.org" + href
+        uid = _make_uid(source_type, href, title)
+        items.append({"title": title, "url": href, "date": "",
+                      "source_type": source_type, "unique_id": uid})
+    logger.info(f"indiankanoon fallback: {len(items)} items")
     return items
