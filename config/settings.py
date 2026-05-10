@@ -1,48 +1,93 @@
 """
-config/settings.py
+config/settings.py — All configuration for Tax Intelligence System
 """
+
 import os
 
-GOOGLE_SHEETS_CREDENTIALS = os.environ.get("GOOGLE_SHEETS_CREDENTIALS", "")
-GOOGLE_SHEET_ID           = os.environ.get("GOOGLE_SHEET_ID", "")
+# ---------------------------------------------------------------------------
+# Telegram
+# ---------------------------------------------------------------------------
+TELEGRAM_BOT_TOKEN         = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHANNEL_NOTIF     = os.environ.get("TELEGRAM_CHANNEL_NOTIF", "")
+TELEGRAM_CHANNEL_CIRCULAR  = os.environ.get("TELEGRAM_CHANNEL_CIRCULAR", "")
+TELEGRAM_CHANNEL_CASELAW   = os.environ.get("TELEGRAM_CHANNEL_CASELAW", "")
+TELEGRAM_CHANNEL_IMPORTANT = os.environ.get("TELEGRAM_CHANNEL_IMPORTANT", "")
 
+# ---------------------------------------------------------------------------
+# Google Sheets
+# ---------------------------------------------------------------------------
+GOOGLE_SHEET_ID          = os.environ.get("GOOGLE_SHEET_ID", "")
+GOOGLE_SHEETS_CREDENTIALS = os.environ.get("GOOGLE_SHEETS_CREDENTIALS", "")  # full JSON string
+
+# ---------------------------------------------------------------------------
+# Source definitions
+# ---------------------------------------------------------------------------
 SOURCES = {
     "notifications": {
-        "url": "https://www.incometaxindia.gov.in/communications/notification/",
-        "type": "Notification",
+        "type":      "notification",
         "sheet_tab": "Notifications",
+        "urls": [
+            "https://www.incometax.gov.in/iec/foportal/help/notifications",
+            "https://incometaxindia.gov.in/communications/notification/",
+        ],
     },
     "circulars": {
-        "url": "https://www.incometaxindia.gov.in/communications/circular/",
-        "type": "Circular",
+        "type":      "circular",
         "sheet_tab": "Circulars",
+        "urls": [
+            "https://www.incometax.gov.in/iec/foportal/help/circulars",
+            "https://incometaxindia.gov.in/communications/circular/",
+        ],
     },
     "caselaws": {
-        "url": "https://itatonline.org/digest/all-judgements/",
-        "type": "Case Law",
+        "type":      "caselaw",
         "sheet_tab": "Case Laws",
+        "urls": [
+            "https://www.itatonline.org/archives/",
+            "https://www.itatonline.org/",
+        ],
     },
 }
 
+# ---------------------------------------------------------------------------
+# Sections that trigger an additional alert to IMPORTANT channel
+# ---------------------------------------------------------------------------
 IMPORTANT_SECTIONS = [
-    "80C", "80D", "80G", "80GG", "80U",
-    "194J", "194C", "194H", "194I", "194A", "194B", "194N",
-    "148", "148A", "147",
-    "37", "37(1)",
-    "139", "139(1)", "139(4)", "139(5)",
-    "271AAC", "271AAB", "271(1)(c)", "271B",
-    "234A", "234B", "234C",
-    "10(10D)", "10(23C)", "10(38)",
-    "56(2)", "68", "69", "69A",
-    "92", "92A", "92B", "92C", "245",
+    "80C", "80D", "80G", "80GG", "80GGA", "80GGC",
+    "148", "148A", "147", "144C",
+    "194J", "194C", "194H", "194I", "194N", "194Q",
+    "271AAC", "271AAB", "271B",
+    "10", "10A", "10AA",
+    "132", "132A", "133A",
+    "12A", "12AA", "12AB",
+    "56", "68", "69", "69A", "69B", "69C",
+    "263", "264",
+    "45", "48", "50C", "54", "54F",
 ]
 
-REQUEST_TIMEOUT   = 60
-MAX_RETRIES       = 2
-RETRY_DELAY       = 3
-MAX_ITEMS_PER_RUN = 30
-STATE_DB_PATH     = "state/seen_items.db"
-STATE_JSON_BACKUP = "state/seen_items.json"
-LOG_LEVEL         = os.environ.get("LOG_LEVEL", "INFO")
-LOG_FILE          = "logs/tax_intel.log"
-SHEET_COLUMNS     = ["Date","Heading","Summary","Sections","Link","Source Type","Unique ID","Scraped Timestamp"]
+# ---------------------------------------------------------------------------
+# HTTP settings
+# ---------------------------------------------------------------------------
+REQUEST_TIMEOUT = 20  # seconds
+REQUEST_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+# ---------------------------------------------------------------------------
+# State / deduplication
+# ---------------------------------------------------------------------------
+STATE_DIR      = os.path.join(os.path.dirname(os.path.dirname(__file__)), "state")
+DB_PATH        = os.path.join(STATE_DIR, "seen_items.db")
+JSON_BACKUP    = os.path.join(STATE_DIR, "seen_items.json")
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+LOG_DIR        = os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs")
+LOG_LEVEL      = os.environ.get("LOG_LEVEL", "INFO")

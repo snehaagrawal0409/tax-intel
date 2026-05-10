@@ -1,138 +1,163 @@
 """
-src/content_extractor.py
-Extract clean text from HTML pages and PDFs.
-Uses requests for PDF download, BeautifulSoup for HTML cleaning.
+src/content_extractor.py — Fetch and extract clean text from URLs (HTML or PDF).
+No Playwright — pure requests.
 """
 
 import io
 import re
 import time
-from typing import Tuple
+from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
 
-from config.settings import REQUEST_TIMEOUT
+from config.settings import REQUEST_HEADERS, REQUEST_TIMEOUT
 from src.logger import get_logger
 
 logger = get_logger("content_extractor")
 
-_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-}
+SESSION = requests.Session()
+SESSION.headers.update(REQUEST_HEADERS)
 
-_JUNK_TAGS = ["script","style","nav","footer","header","noscript","aside","iframe","form","button"]
-_JUNK_CLS  = re.compile(
-    r"(nav|navbar|menu|footer|header|sidebar|breadcrumb|pagination|"
-    r"cookie|popup|modal|social|share|search|login|topbar|toolbar|ad-|banner)",
-    re.IGNORECASE,
+_BOILERPLATE = re.compile(
+    r"(cookie|privacy policy|terms of use|skip to (main )?content|"
+    r"javascript is (disabled|required)|all rights reserved)",
+    re.I,
 )
 
 
-def _clean(text: str) -> str:
-    lines = [l.strip() for l in text.splitlines()]
-    lines = [l for l in lines if len(l) > 3]
-    deduped, prev = [], None
-    for l in lines:
-        if l != prev:
-            deduped.append(l)
-        prev = l
-    return "\n".join(deduped).strip()
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+def fetch_content(url: str) -> tuple[str, str]:
+    """
+    Returns (content_text, content_type) where content_type is one of:
+      'pdf', 'html', 'none'
+    """
+    if not url or not url.startswith("http"):
+        return "", "none"
+
+    try:
+        resp = SESSION.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+        resp.raise_for_status()
+    except Exception as e:
+        logger.warning(f"fetch_content GET failed for {url}: {e}")
+        return "", "none"
+
+    ct = resp.headers.get("Content-Type", "").lower()
+
+    # PDF
+    if "pdf" in ct or url.lower().endswith(".pdf"):
+        text = _extract_pdf(resp.content)
+        return text, "pdf"
+
+    # HTML
+    text = _extract_html(resp.text)
+    return text, "html"
 
 
-def extract_html(html: str) -> str:
-    soup = BeautifulSoup(html, "lxml")
-    for tag in soup(_JUNK_TAGS):
-        tag.decompose()
-    for tag in soup.find_all(True):
-        cls = " ".join(tag.get("class", []))
-        tid = tag.get("id", "")
-        if _JUNK_CLS.search(cls) or _JUNK_CLS.search(tid):
-            tag.decompose()
+# ---------------------------------------------------------------------------
+# PDF extraction
+# ---------------------------------------------------------------------------
 
-    for selector in ["article", "main",
-                     lambda s: s.find(attrs={"class": re.compile("content|article|post|entry|body", re.I)}),
-                     "body"]:
-        if callable(selector):
-            el = selector(soup)
-        else:
-            el = soup.find(selector)
-        if el:
-            t = el.get_text(separator="\n")
-            if len(t.strip()) > 100:
-                return _clean(t)
-
-    return _clean(soup.get_text(separator="\n"))
-
-
-def extract_pdf(pdf_bytes: bytes) -> str:
+def _extract_pdf(content: bytes) -> str:
     # Try pdfplumber first
     try:
         import pdfplumber
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            parts = [p.extract_text() for p in pdf.pages[:15] if p.extract_text()]
-            text = "\n".join(parts)
+        with pdfplumber.open(io.BytesIO(content)) as pdf:
+            pages = []
+            for page in pdf.pages[:10]:  # cap at 10 pages
+                txt = page.extract_text()
+                if txt:
+                    pages.append(txt.strip())
+            text = "\n\n".join(pages)
             if text.strip():
-                return _clean(text)
+                return text
     except Exception as e:
-        logger.warning(f"pdfplumber failed: {e}")
+        logger.debug(f"pdfplumber failed: {e}")
 
-    # PyPDF2 fallback
+    # Fallback: pypdf
     try:
-        import PyPDF2
-        reader = PyPDF2.PdfReader(io.BytesIO(pdf_bytes))
-        parts = []
-        for page in reader.pages[:15]:
-            try:
-                t = page.extract_text()
-                if t:
-                    parts.append(t)
-            except Exception:
-                pass
-        text = "\n".join(parts)
-        if text.strip():
-            return _clean(text)
+        from pypdf import PdfReader
+        reader = PdfReader(io.BytesIO(content))
+        pages  = []
+        for page in reader.pages[:10]:
+            txt = page.extract_text()
+            if txt:
+                pages.append(txt.strip())
+        return "\n\n".join(pages)
     except Exception as e:
-        logger.warning(f"PyPDF2 failed: {e}")
+        logger.debug(f"PyPDF2 failed: {e}")
 
     return ""
 
 
-def fetch_content(url: str) -> Tuple[str, str]:
+# ---------------------------------------------------------------------------
+# HTML extraction
+# ---------------------------------------------------------------------------
+
+def _extract_html(html: str) -> str:
+    soup = BeautifulSoup(html, "lxml")
+
+    # Remove noise tags
+    for tag in soup(["script", "style", "nav", "header", "footer",
+                     "aside", "form", "noscript", "iframe"]):
+        tag.decompose()
+
+    # Try to find the main content area
+    main = (
+        soup.find("main")
+        or soup.find(id=re.compile(r"main|content|article", re.I))
+        or soup.find(class_=re.compile(r"main|content|article|post-body|entry", re.I))
+        or soup.find("article")
+        or soup.body
+    )
+
+    if main is None:
+        return ""
+
+    lines = []
+    for text in main.stripped_strings:
+        line = re.sub(r"\s+", " ", text).strip()
+        if len(line) < 4:
+            continue
+        if _BOILERPLATE.search(line):
+            continue
+        lines.append(line)
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Summarizer (simple extractive; no LLM dependency)
+# ---------------------------------------------------------------------------
+
+def summarize(content: str, max_chars: int = 800) -> str:
     """
-    Fetch URL and extract clean text.
-    Returns (text, content_type) where content_type is 'html' or 'pdf'.
+    Extractive summarisation: return the first meaningful sentences up to max_chars.
+    Falls back to first max_chars chars if sentence splitting fails.
     """
-    for attempt in range(1, 3):
-        try:
-            resp = requests.get(url, headers=_HEADERS, timeout=REQUEST_TIMEOUT,
-                                allow_redirects=True, verify=False)
-            resp.raise_for_status()
-            ct = resp.headers.get("Content-Type", "")
-            if "pdf" in ct.lower() or url.lower().endswith(".pdf"):
-                return extract_pdf(resp.content), "pdf"
-            else:
-                return extract_html(resp.text), "html"
-        except Exception as e:
-            logger.warning(f"Content fetch attempt {attempt} failed for {url}: {e}")
-            if attempt < 2:
-                time.sleep(2)
+    if not content:
+        return ""
 
-    return "", "error"
+    content = re.sub(r"\n{3,}", "\n\n", content.strip())
 
+    # Split into sentences on '. ', '.\n', '! ', '? '
+    sentences = re.split(r"(?<=[.!?])\s+", content)
+    result    = []
+    length    = 0
 
-def summarize(text: str, max_chars: int = 500, max_sents: int = 3) -> str:
-    if not text:
-        return "No content available."
-    sentences = re.split(r'(?<=[.!?])\s+', text)
-    sentences = [s.strip() for s in sentences if len(s.strip()) > 30]
-    parts, total = [], 0
-    for s in sentences[:15]:
-        if total + len(s) > max_chars or len(parts) >= max_sents:
+    for sent in sentences:
+        sent = sent.strip()
+        if len(sent) < 10:
+            continue
+        if length + len(sent) > max_chars:
             break
-        parts.append(s)
-        total += len(s)
-    if parts:
-        return " ".join(parts)
-    return text[:max_chars].strip() + ("…" if len(text) > max_chars else "")
+        result.append(sent)
+        length += len(sent) + 1
+
+    summary = " ".join(result) if result else content[:max_chars]
+    if len(content) > max_chars:
+        summary = summary.rstrip(".") + "…"
+    return summary

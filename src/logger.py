@@ -1,44 +1,45 @@
 """
-src/logger.py
-Centralized logging setup for the Tax Intelligence System.
+src/logger.py — Structured logging setup
 """
 
 import logging
 import os
 import sys
-from logging.handlers import RotatingFileHandler
-from config.settings import LOG_LEVEL, LOG_FILE
+from datetime import datetime
+
+from config.settings import LOG_DIR, LOG_LEVEL
 
 
-def get_logger(name: str = "tax_intel") -> logging.Logger:
-    """Return a configured logger instance."""
+def get_logger(name: str) -> logging.Logger:
+    os.makedirs(LOG_DIR, exist_ok=True)
+
     logger = logging.getLogger(name)
-
     if logger.handlers:
         return logger  # already configured
 
     level = getattr(logging, LOG_LEVEL.upper(), logging.INFO)
     logger.setLevel(level)
 
-    formatter = logging.Formatter(
-        fmt="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+    fmt = logging.Formatter(
+        "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
     # Console handler
     ch = logging.StreamHandler(sys.stdout)
     ch.setLevel(level)
-    ch.setFormatter(formatter)
+    ch.setFormatter(fmt)
     logger.addHandler(ch)
 
-    # File handler (rotating)
+    # File handler (daily log)
+    log_file = os.path.join(LOG_DIR, f"{datetime.utcnow().strftime('%Y-%m-%d')}.log")
     try:
-        os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
-        fh = RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3)
+        fh = logging.FileHandler(log_file, encoding="utf-8")
         fh.setLevel(level)
-        fh.setFormatter(formatter)
+        fh.setFormatter(fmt)
         logger.addHandler(fh)
-    except Exception as e:
-        logger.warning(f"Could not set up file logging: {e}")
+    except OSError:
+        pass  # non-fatal if log dir isn't writable
 
+    logger.propagate = False
     return logger

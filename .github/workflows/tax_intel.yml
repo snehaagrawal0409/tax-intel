@@ -2,111 +2,72 @@ name: Tax Intelligence System
 
 on:
   schedule:
-    - cron: "0 */2 * * *"
-  workflow_dispatch:
-    inputs:
-      debug_mode:
-        description: "Enable debug logging"
-        required: false
-        default: "false"
+    - cron: "0 */2 * * *"   # every 2 hours
+  workflow_dispatch:          # allow manual trigger
+
+permissions:
+  contents: write             # needed to commit state/seen_items.json
 
 jobs:
-  run-tax-intel:
-    name: Run Tax Intelligence System
+  run:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 15
 
     steps:
+      # -----------------------------------------------------------------------
+      # 1. Checkout (full history so we can push back the state file)
+      # -----------------------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Restore deduplication state
-        uses: actions/cache@v4
         with:
-          path: state/
-          key: tax-intel-state-${{ runner.os }}-${{ github.run_number }}
-          restore-keys: |
-            tax-intel-state-${{ runner.os }}-
+          fetch-depth: 1
 
-      - name: Set up Python 3.11
+      # -----------------------------------------------------------------------
+      # 2. Set up Python
+      # -----------------------------------------------------------------------
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
 
-      - name: Install Python dependencies
+      # -----------------------------------------------------------------------
+      # 3. Cache pip dependencies
+      # -----------------------------------------------------------------------
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: pip-
+
+      # -----------------------------------------------------------------------
+      # 4. Cache SQLite state between runs (fast path; JSON backup is fallback)
+      # -----------------------------------------------------------------------
+      - name: Cache SQLite state
+        uses: actions/cache@v4
+        with:
+          path: state/seen_items.db
+          key: sqlite-state-${{ github.run_id }}
+          restore-keys: sqlite-state-
+
+      # -----------------------------------------------------------------------
+      # 5. Install Python dependencies (no playwright)
+      # -----------------------------------------------------------------------
+      - name: Install dependencies
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Install Playwright browsers
-        run: |
-          playwright install chromium
-          playwright install-deps chromium
-
+      # -----------------------------------------------------------------------
+      # 6. Create required directories
+      # -----------------------------------------------------------------------
       - name: Prepare directories
-        run: mkdir -p state logs
-
-      - name: Verify Telegram Bot (pre-flight check)
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHANNEL_NOTIF: ${{ secrets.TELEGRAM_CHANNEL_NOTIF }}
-          TELEGRAM_CHANNEL_CIRCULAR: ${{ secrets.TELEGRAM_CHANNEL_CIRCULAR }}
-          TELEGRAM_CHANNEL_CASELAW: ${{ secrets.TELEGRAM_CHANNEL_CASELAW }}
-          TELEGRAM_CHANNEL_IMPORTANT: ${{ secrets.TELEGRAM_CHANNEL_IMPORTANT }}
         run: |
-          python3 << 'PYEOF'
-          import os, requests, sys
+          mkdir -p state logs
 
-          token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-          if not token:
-              print("ERROR: TELEGRAM_BOT_TOKEN not set!")
-              sys.exit(1)
-
-          # Verify bot is valid
-          r = requests.get(f"https://api.telegram.org/bot{token}/getMe", timeout=10)
-          if not r.ok:
-              print(f"ERROR: Bot token invalid — {r.text}")
-              sys.exit(1)
-          bot_info = r.json()
-          print(f"Bot OK: @{bot_info['result']['username']}")
-
-          # Check each channel
-          channels = {
-              "NOTIF":     os.environ.get("TELEGRAM_CHANNEL_NOTIF", ""),
-              "CIRCULAR":  os.environ.get("TELEGRAM_CHANNEL_CIRCULAR", ""),
-              "CASELAW":   os.environ.get("TELEGRAM_CHANNEL_CASELAW", ""),
-              "IMPORTANT": os.environ.get("TELEGRAM_CHANNEL_IMPORTANT", ""),
-          }
-
-          all_ok = True
-          for name, ch in channels.items():
-              if not ch:
-                  print(f"WARNING: TELEGRAM_CHANNEL_{name} not set")
-                  continue
-              r2 = requests.post(
-                  f"https://api.telegram.org/bot{token}/getChat",
-                  json={"chat_id": ch}, timeout=10
-              )
-              if r2.ok:
-                  chat = r2.json()["result"]
-                  print(f"Channel {name} OK: {chat.get('title','?')} (id={chat.get('id','?')})")
-              else:
-                  err = r2.json().get("description","?")
-                  print(f"ERROR Channel {name} ({ch}): {err}")
-                  print(f"  >>> Fix: Make sure bot is admin in this channel")
-                  all_ok = False
-
-          if not all_ok:
-              print("\nSome channels failed. Check that:")
-              print("1. Channel is PUBLIC")
-              print("2. Bot is added as ADMIN to the channel")
-              print("3. The @username in secrets matches exactly")
-              sys.exit(1)
-
-          print("All Telegram checks passed!")
-          PYEOF
-
+      # -----------------------------------------------------------------------
+      # 7. Run the main script
+      # -----------------------------------------------------------------------
       - name: Run Tax Intelligence System
         env:
           TELEGRAM_BOT_TOKEN:         ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -114,42 +75,20 @@ jobs:
           TELEGRAM_CHANNEL_CIRCULAR:  ${{ secrets.TELEGRAM_CHANNEL_CIRCULAR }}
           TELEGRAM_CHANNEL_CASELAW:   ${{ secrets.TELEGRAM_CHANNEL_CASELAW }}
           TELEGRAM_CHANNEL_IMPORTANT: ${{ secrets.TELEGRAM_CHANNEL_IMPORTANT }}
-          GOOGLE_SHEETS_CREDENTIALS:  ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
           GOOGLE_SHEET_ID:            ${{ secrets.GOOGLE_SHEET_ID }}
-          LOG_LEVEL: ${{ github.event.inputs.debug_mode == 'true' && 'DEBUG' || 'INFO' }}
+          GOOGLE_SHEETS_CREDENTIALS:  ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
         run: python main.py
 
-      - name: Upload logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: tax-intel-logs-${{ github.run_number }}
-          path: logs/
-          retention-days: 14
-
+      # -----------------------------------------------------------------------
+      # 8. Commit state/seen_items.json back so dedup persists across runs
+      #    even when the cache misses.
+      # -----------------------------------------------------------------------
       - name: Commit state backup
-        if: always()
+        if: always()    # run even if main.py had errors
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add state/seen_items.json || true
-          git diff --staged --quiet || git commit -m "chore: update dedup state [skip ci]"
+          # Only commit if there's something new
+          git diff --cached --quiet || git commit -m "chore: update seen_items state [skip ci]"
           git push || true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Notify on failure
-        if: failure()
-        env:
-          TELEGRAM_BOT_TOKEN:         ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHANNEL_IMPORTANT: ${{ secrets.TELEGRAM_CHANNEL_IMPORTANT }}
-        run: |
-          python3 -c "
-          import os, requests
-          t = os.getenv('TELEGRAM_BOT_TOKEN','')
-          c = os.getenv('TELEGRAM_CHANNEL_IMPORTANT','')
-          if t and c:
-              requests.post(f'https://api.telegram.org/bot{t}/sendMessage',
-                  json={'chat_id':c,'text':'⚠️ Tax Intel run FAILED. Check GitHub Actions logs.'},
-                  timeout=10)
-          " || true

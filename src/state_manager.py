@@ -1,121 +1,114 @@
 """
-src/state_manager.py
-Persistent deduplication using SQLite + JSON backup.
-Survives CI/container restarts when state/ dir is cached or committed.
+src/state_manager.py — SQLite dedup with JSON fallback for CI persistence
 """
 
 import json
 import os
 import sqlite3
-import time
-from typing import Set
+from datetime import datetime, timezone
 
-from config.settings import STATE_DB_PATH, STATE_JSON_BACKUP
+from config.settings import DB_PATH, JSON_BACKUP, STATE_DIR
 from src.logger import get_logger
 
 logger = get_logger("state_manager")
 
 
-def _ensure_dirs():
-    os.makedirs(os.path.dirname(STATE_DB_PATH), exist_ok=True)
-    os.makedirs(os.path.dirname(STATE_JSON_BACKUP), exist_ok=True)
-
-
-def _get_conn() -> sqlite3.Connection:
-    _ensure_dirs()
-    conn = sqlite3.connect(STATE_DB_PATH)
-    conn.execute(
-        """
+def _ensure_db() -> sqlite3.Connection:
+    os.makedirs(STATE_DIR, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS seen_items (
             unique_id   TEXT PRIMARY KEY,
             source_type TEXT,
-            heading     TEXT,
-            first_seen  REAL
+            title       TEXT,
+            seen_at     TEXT
         )
-        """
-    )
+    """)
     conn.commit()
     return conn
 
 
 def is_seen(unique_id: str) -> bool:
-    """Return True if unique_id has been processed before."""
+    if not unique_id:
+        return False
     try:
-        conn = _get_conn()
+        conn = _ensure_db()
         row = conn.execute(
             "SELECT 1 FROM seen_items WHERE unique_id = ?", (unique_id,)
         ).fetchone()
         conn.close()
         return row is not None
     except Exception as e:
-        logger.error(f"State check failed for {unique_id}: {e}")
-        return False  # fail-open: process the item to avoid missing it
+        logger.warning(f"is_seen DB error: {e}")
+        return False
 
 
-def mark_seen(unique_id: str, source_type: str = "", heading: str = ""):
-    """Mark a unique_id as processed."""
+def mark_seen(unique_id: str, source_type: str = "", title: str = "") -> None:
+    if not unique_id:
+        return
     try:
-        conn = _get_conn()
+        conn = _ensure_db()
         conn.execute(
-            """
-            INSERT OR IGNORE INTO seen_items (unique_id, source_type, heading, first_seen)
-            VALUES (?, ?, ?, ?)
-            """,
-            (unique_id, source_type, heading[:200], time.time()),
+            "INSERT OR REPLACE INTO seen_items (unique_id, source_type, title, seen_at) "
+            "VALUES (?, ?, ?, ?)",
+            (unique_id, source_type, title[:300], datetime.now(timezone.utc).isoformat()),
         )
         conn.commit()
         conn.close()
-        _sync_json_backup()
     except Exception as e:
-        logger.error(f"Failed to mark {unique_id} as seen: {e}")
+        logger.warning(f"mark_seen DB error: {e}")
+
+    # Also update JSON backup
+    _update_json_backup(unique_id, source_type, title)
 
 
-def get_all_seen() -> Set[str]:
-    """Return set of all seen unique IDs."""
+def _update_json_backup(unique_id: str, source_type: str, title: str) -> None:
+    os.makedirs(STATE_DIR, exist_ok=True)
     try:
-        conn = _get_conn()
-        rows = conn.execute("SELECT unique_id FROM seen_items").fetchall()
-        conn.close()
-        return {r[0] for r in rows}
+        data: dict = {}
+        if os.path.exists(JSON_BACKUP):
+            with open(JSON_BACKUP, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        data[unique_id] = {
+            "source_type": source_type,
+            "title":       title[:300],
+            "seen_at":     datetime.now(timezone.utc).isoformat(),
+        }
+        with open(JSON_BACKUP, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        logger.error(f"Failed to get all seen items: {e}")
-        return set()
+        logger.warning(f"JSON backup update error: {e}")
 
 
-def _sync_json_backup():
-    """Write JSON backup of all seen IDs (useful for committing to git)."""
-    try:
-        seen = get_all_seen()
-        _ensure_dirs()
-        with open(STATE_JSON_BACKUP, "w") as f:
-            json.dump(sorted(seen), f, indent=2)
-    except Exception as e:
-        logger.warning(f"JSON backup sync failed: {e}")
-
-
-def restore_from_json_if_empty():
-    """
-    On fresh CI run where SQLite is missing but JSON backup is committed,
-    restore state from JSON so we don't re-process old items.
-    """
-    seen = get_all_seen()
-    if seen:
-        return  # SQLite already has data
-
-    if not os.path.exists(STATE_JSON_BACKUP):
+def restore_from_json_if_empty() -> None:
+    """Called at startup: if SQLite is empty, restore from JSON backup (CI cache miss)."""
+    if not os.path.exists(JSON_BACKUP):
+        logger.info("No JSON backup found — starting fresh")
         return
-
     try:
-        with open(STATE_JSON_BACKUP) as f:
-            ids = json.load(f)
-        conn = _get_conn()
-        for uid in ids:
-            conn.execute(
-                "INSERT OR IGNORE INTO seen_items (unique_id, source_type, heading, first_seen) VALUES (?,?,?,?)",
-                (uid, "restored", "", time.time()),
-            )
+        conn = _ensure_db()
+        count = conn.execute("SELECT COUNT(*) FROM seen_items").fetchone()[0]
+        if count > 0:
+            logger.info(f"SQLite has {count} items — skip restore")
+            conn.close()
+            return
+
+        with open(JSON_BACKUP, "r", encoding="utf-8") as f:
+            data: dict = json.load(f)
+
+        restored = 0
+        for uid, meta in data.items():
+            try:
+                conn.execute(
+                    "INSERT OR IGNORE INTO seen_items (unique_id, source_type, title, seen_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (uid, meta.get("source_type", ""), meta.get("title", ""), meta.get("seen_at", "")),
+                )
+                restored += 1
+            except Exception:
+                pass
         conn.commit()
         conn.close()
-        logger.info(f"Restored {len(ids)} seen IDs from JSON backup")
+        logger.info(f"Restored {restored} items from JSON backup into SQLite")
     except Exception as e:
-        logger.error(f"Failed to restore from JSON backup: {e}")
+        logger.warning(f"restore_from_json_if_empty error: {e}")

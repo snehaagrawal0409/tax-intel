@@ -1,144 +1,164 @@
 """
-src/telegram_sender.py
-Reads ALL credentials from environment at call-time.
+src/telegram_sender.py — Send formatted messages to Telegram channels.
 """
 
-import os
 import time
-from typing import Dict, List
+from typing import Optional
 
 import requests
 
-from src.section_analyzer import is_important, sections_display
+from config.settings import (
+    IMPORTANT_SECTIONS,
+    TELEGRAM_BOT_TOKEN,
+    TELEGRAM_CHANNEL_CIRCULAR,
+    TELEGRAM_CHANNEL_CASELAW,
+    TELEGRAM_CHANNEL_IMPORTANT,
+    TELEGRAM_CHANNEL_NOTIF,
+)
 from src.logger import get_logger
 
 logger = get_logger("telegram_sender")
 
-_TYPE_EMOJI = {"Notification": "📋", "Circular": "🔵", "Case Law": "⚖️"}
-MAX_LEN     = 4096
-RETRIES     = 3
-RETRY_DELAY = 4
+_API_BASE = "https://api.telegram.org/bot{token}/sendMessage"
 
 
-def _token() -> str:
-    return os.environ.get("TELEGRAM_BOT_TOKEN", "")
+# ---------------------------------------------------------------------------
+# Internal send primitive
+# ---------------------------------------------------------------------------
 
-def _channel(source_type: str) -> str:
-    return {
-        "Notification": os.environ.get("TELEGRAM_CHANNEL_NOTIF", ""),
-        "Circular":     os.environ.get("TELEGRAM_CHANNEL_CIRCULAR", ""),
-        "Case Law":     os.environ.get("TELEGRAM_CHANNEL_CASELAW", ""),
-    }.get(source_type, "")
+def _send(chat_id: str, text: str, retries: int = 3) -> bool:
+    if not TELEGRAM_BOT_TOKEN:
+        logger.warning("TELEGRAM_BOT_TOKEN not set — skipping send")
+        return False
+    if not chat_id:
+        logger.warning("chat_id empty — skipping send")
+        return False
 
-def _important_ch() -> str:
-    return os.environ.get("TELEGRAM_CHANNEL_IMPORTANT", "")
+    url     = _API_BASE.format(token=TELEGRAM_BOT_TOKEN)
+    payload = {
+        "chat_id":                  chat_id,
+        "text":                     text,
+        "parse_mode":               "HTML",
+        "disable_web_page_preview": True,
+    }
+
+    for attempt in range(1, retries + 1):
+        try:
+            resp = requests.post(url, json=payload, timeout=15)
+            data = resp.json()
+            if data.get("ok"):
+                return True
+            # Telegram error
+            err = data.get("description", "unknown error")
+            logger.warning(f"Telegram API error (attempt {attempt}): {err}")
+            if "Too Many Requests" in err:
+                retry_after = data.get("parameters", {}).get("retry_after", 5)
+                time.sleep(retry_after)
+            else:
+                time.sleep(2)
+        except Exception as e:
+            logger.warning(f"Telegram send exception (attempt {attempt}): {e}")
+            time.sleep(3 * attempt)
+
+    return False
 
 
-def _build_msg(item: Dict) -> str:
-    emoji    = _TYPE_EMOJI.get(item.get("source_type", ""), "📄")
-    sections = item.get("sections", [])
-    imp_flag = " 🔥 <b>IMPORTANT</b>" if is_important(sections) else ""
-    summary  = (item.get("summary") or "No summary available.")[:600]
-    title    = (item.get("title") or "N/A")[:300]
-    date     = item.get("date") or "N/A"
-    url      = item.get("url", "")
-    stype    = item.get("source_type", "Update")
-    secs     = sections_display(sections)
+# ---------------------------------------------------------------------------
+# Message formatter
+# ---------------------------------------------------------------------------
 
+def _format_message(item: dict) -> str:
+    source_type  = item.get("source_type", "").lower()
+    title        = item.get("title", "")
+    url          = item.get("url", "")
+    date         = item.get("date", "")
+    summary      = item.get("summary", "")
+    sections_str = item.get("sections_str", "")
+    sections     = item.get("sections", [])
+
+    # Header emoji + label
+    type_labels = {
+        "notification": ("📋", "Notification"),
+        "circular":     ("📢", "Circular"),
+        "caselaw":      ("⚖️",  "ITAT Case Law"),
+    }
+    emoji, label = type_labels.get(source_type, ("📄", source_type.title()))
+
+    # Important sections badge
+    important_badge = ""
+    if any(s in IMPORTANT_SECTIONS for s in sections):
+        important_badge = " 🔥 <b>IMPORTANT SECTIONS</b>"
+
+    lines = [
+        f"{emoji} <b>{label}</b>{important_badge}",
+        "━━━━━━━━━━━━━━━━━━",
+    ]
+    if date:
+        lines.append(f"📅 <b>Date:</b> {date}")
+    lines.append(f"📌 <b>Title:</b> {_escape(title)}")
+    if sections_str:
+        lines.append(f"🏷️ <b>Sections:</b> {_escape(sections_str)}")
+    lines.append("━━━━━━━━━━━━━━━━━━")
+
+    if summary:
+        lines.append(f"📝 <b>Summary:</b>")
+        # Telegram message limit: 4096 chars. Reserve space for the rest.
+        max_summary = 3000 - sum(len(l) for l in lines)
+        lines.append(_escape(summary[:max(200, max_summary)]))
+        lines.append("━━━━━━━━━━━━━━━━━━")
+
+    if url:
+        lines.append(f'🔗 <a href="{url}">View Source</a>')
+
+    return "\n".join(lines)
+
+
+def _escape(text: str) -> str:
+    """Minimal HTML escape for Telegram HTML parse mode."""
     return (
-        f"{emoji} <b>{stype}</b>{imp_flag}\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"📅 <b>Date:</b> {date}\n"
-        f"📌 <b>Title:</b> {title}\n"
-        f"🏷 <b>Sections:</b> {secs}\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"📝 <b>Summary:</b>\n{summary}\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"🔗 <a href=\"{url}\">View Source</a>"
+        text.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
     )
 
 
-def _split(text: str) -> List[str]:
-    if len(text) <= MAX_LEN:
-        return [text]
-    chunks = []
-    while text:
-        if len(text) <= MAX_LEN:
-            chunks.append(text)
-            break
-        cut = text.rfind("\n", 0, MAX_LEN)
-        if cut == -1:
-            cut = MAX_LEN
-        chunks.append(text[:cut])
-        text = text[cut:].lstrip()
-    return chunks
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
+def send_item(item: dict) -> bool:
+    source_type  = item.get("source_type", "")
+    sections     = item.get("sections", [])
 
-def _send(channel: str, text: str) -> bool:
-    token = _token()
-    if not token:
-        logger.error("TELEGRAM_BOT_TOKEN not set")
-        return False
-    if not channel:
-        logger.warning("No Telegram channel set — skipping")
+    channel_map = {
+        "notification": TELEGRAM_CHANNEL_NOTIF,
+        "circular":     TELEGRAM_CHANNEL_CIRCULAR,
+        "caselaw":      TELEGRAM_CHANNEL_CASELAW,
+    }
+    primary_channel = channel_map.get(source_type, "")
+
+    if not primary_channel:
+        logger.warning(f"No channel configured for source_type={source_type}")
         return False
 
-    api = f"https://api.telegram.org/bot{token}/sendMessage"
-    for i, chunk in enumerate(_split(text)):
-        sent = False
-        for attempt in range(1, RETRIES + 1):
-            try:
-                r = requests.post(
-                    api,
-                    json={"chat_id": channel, "text": chunk,
-                          "parse_mode": "HTML", "disable_web_page_preview": True},
-                    timeout=15,
-                )
-                if r.ok:
-                    sent = True
-                    break
-                # Log exact Telegram error
-                err = r.json().get("description", r.text[:300])
-                logger.warning(f"Telegram error (attempt {attempt}): {r.status_code} — {err}")
-                # If bad channel ID, no point retrying
-                if r.status_code == 400 and "chat not found" in err.lower():
-                    logger.error(f"CHANNEL NOT FOUND: '{channel}' — check TELEGRAM_CHANNEL_* secret")
-                    return False
-            except Exception as e:
-                logger.warning(f"Telegram send exception attempt {attempt}: {e}")
-            if attempt < RETRIES:
-                time.sleep(RETRY_DELAY)
+    message = _format_message(item)
 
-        if not sent:
-            logger.error(f"Failed sending chunk {i+1} to {channel}")
-            return False
-        if i > 0:
-            time.sleep(0.5)
+    # Trim if over 4096 limit
+    if len(message) > 4096:
+        message = message[:4090] + "…"
 
-    return True
+    ok = _send(primary_channel, message)
 
-
-def send_item(item: Dict) -> bool:
-    ch = _channel(item.get("source_type", ""))
-    if not ch:
-        logger.error(
-            f"No channel env var set for source_type='{item.get('source_type')}'. "
-            f"Check TELEGRAM_CHANNEL_NOTIF / TELEGRAM_CHANNEL_CIRCULAR / TELEGRAM_CHANNEL_CASELAW secrets."
-        )
-        return False
-
-    msg = _build_msg(item)
-    ok  = _send(ch, msg)
-
-    # Also send to important channel if relevant sections
-    imp = _important_ch()
-    if is_important(item.get("sections", [])) and imp and imp != ch:
-        _send(imp, msg)
+    # Also send to IMPORTANT channel if relevant sections found
+    if TELEGRAM_CHANNEL_IMPORTANT and any(s in IMPORTANT_SECTIONS for s in sections):
+        _send(TELEGRAM_CHANNEL_IMPORTANT, message)
+        time.sleep(0.5)
 
     return ok
 
 
-def send_error_alert(message: str):
-    ch = _important_ch() or os.environ.get("TELEGRAM_CHANNEL_NOTIF", "")
-    if ch:
-        _send(ch, f"⚠️ <b>Tax Intel Error</b>\n\n{message[:400]}")
+def send_error_alert(error_text: str) -> None:
+    if not TELEGRAM_CHANNEL_IMPORTANT:
+        return
+    msg = f"🚨 <b>Tax Intel Error</b>\n\n<code>{_escape(str(error_text)[:500])}</code>"
+    _send(TELEGRAM_CHANNEL_IMPORTANT, msg)
